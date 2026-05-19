@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Matrix Rain</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="matrix"></canvas>
+<script>
+  const THEMES = [
+    [ // gruvbox
+      { head: '#fb4934', body: [204,  36,  29] },
+      { head: '#b8bb26', body: [152, 151,  26] },
+      { head: '#fabd2f', body: [215, 153,  33] },
+      { head: '#fe8019', body: [214,  93,  14] },
+      { head: '#8ec07c', body: [104, 157, 106] },
+      { head: '#d3869b', body: [177,  98, 134] },
+    ],
+    [ // neon
+      { head: '#ff00ff', body: [200,   0, 200] },
+      { head: '#00ffff', body: [  0, 200, 200] },
+      { head: '#ff0099', body: [200,   0, 120] },
+      { head: '#00ff99', body: [  0, 200, 120] },
+      { head: '#ff6600', body: [200,  80,   0] },
+      { head: '#ccff00', body: [160, 200,   0] },
+    ],
+    [ // classic matrix green
+      { head: '#ccffcc', body: [  0, 220,  65] },
+    ],
+    [ // terminal 256
+      { head: '#ff0000', body: [180,   0,   0] },
+      { head: '#ff5f00', body: [180,  60,   0] },
+      { head: '#ffff00', body: [180, 180,   0] },
+      { head: '#00ff00', body: [  0, 180,   0] },
+      { head: '#00ffff', body: [  0, 180, 180] },
+      { head: '#0087ff', body: [  0, 100, 180] },
+      { head: '#5f00ff', body: [ 60,   0, 180] },
+      { head: '#ff00af', body: [180,   0, 120] },
+      { head: '#ff87af', body: [180, 100, 130] },
+      { head: '#87ff87', body: [ 90, 180,  90] },
+      { head: '#87d7ff', body: [ 90, 160, 180] },
+      { head: '#afafff', body: [120, 120, 180] },
+      { head: '#ffd75f', body: [180, 160,  60] },
+      { head: '#d75fd7', body: [160,  60, 160] },
+      { head: '#5faf87', body: [ 60, 130, 100] },
+      { head: '#ff875f', body: [180, 100,  60] },
+    ],
+  ];
+
+  const CONFIG = {
+    tailMean:    20,
+    tailSpread:  6,
+    speedMean:   15,
+    speedSpread: 10,
+    colors: THEMES[Math.floor(Math.random() * THEMES.length)],
+    density:     1.26,
+    flySpeed:    120,
+    focal:       300,
+    zFar:        1200,
+    zNear:       60,
+    baseFont:    14,
+
+    // apoptosis
+    deathRate:     0.20,  // probability of dying per second (0..1)
+    deathFadeMs:   1200,  // ms to fully fade out after death
+
+    // pulse
+    bpm:           60,    // beats per minute
+    pulseDuration: 120,   // ms for the wave to travel zFar → zNear (fast sweep)
+    pulseWidth:    150,   // world-z half-width of the trigger band
+    pulseStrength: 1.0,   // 0..1 peak boost
+    glowDecayMs:   400,   // ms for per-stream glow to decay after wave passes
+  };
+
+  const canvas = document.getElementById('matrix');
+  const ctx    = canvas.getContext('2d');
+
+  const CHARS = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789';
+
+  const CHARS_LEN = CHARS.length;
+  function randChar() {
+    return CHARS[Math.random() * CHARS_LEN | 0];
+  }
+
+  function randInRange(mean, spread) {
+    return mean + (Math.random() - 0.5) * 2 * spread;
+  }
+
+  // ── precomputed caches ────────────────────────────────────────────────────
+
+  const ALPHA_STEPS = 64;
+
+  const colorCache = CONFIG.colors.map(({ head, body: [r, g, b] }) => {
+    const n = parseInt(head.slice(1), 16);
+    return {
+      head,
+      headRgb: [(n >> 16) & 255, (n >> 8) & 255, n & 255],
+      body:    [r, g, b],
+      tail: Array.from({ length: ALPHA_STEPS }, (_, i) => {
+        const alpha = Math.pow(1 - i / ALPHA_STEPS, 1.5).toFixed(3);
+        return `rgba(${r},${g},${b},${alpha})`;
+      }),
+    };
+  });
+
+  // font strings keyed by integer pixel size
+  const fontCache = {};
+  function getFont(size) {
+    return fontCache[size] || (fontCache[size] = size + 'px monospace');
+  }
+
+  // ── stream factory ────────────────────────────────────────────────────────
+
+  function spawnStream(zOverride) {
+    const { focal, zFar, zNear, baseFont, speedMean, speedSpread, tailMean, tailSpread } = CONFIG;
+    const r = Math.random(), c = 0.28; // asymmetric triangle: peak at 28% of range ≈ z380, fontF≈11px
+    const u = r < c ? Math.sqrt(r * c) : 1 - Math.sqrt((1 - r) * (1 - c));
+    const z = zOverride ?? (zNear + (zFar - zNear) * u);
+
+    const halfWorld = (canvas.width / 2) * z / focal;
+    const gridCount = Math.max(1, Math.floor(2 * halfWorld / baseFont));
+    const x         = (Math.floor(Math.random() * gridCount) - gridCount / 2) * baseFont;
+
+    const tailLen  = Math.max(2, Math.round(randInRange(tailMean, tailSpread)));
+    const speed    = Math.max(1, randInRange(speedMean, speedSpread));
+    const fontSize = Math.max(4, Math.round(baseFont * focal / z));
+    const rows     = Math.ceil(canvas.height / fontSize);
+
+    return {
+      x, z,
+      y:         Math.random() * rows | 0,
+      tailLen,
+      step:      (1000 / speedMean) * z / focal,
+      acc:       0,
+      chars:     Array.from({ length: tailLen }, randChar),
+      head:      0,
+      colorIdx:   Math.random() * CONFIG.colors.length | 0,
+      speed,
+      invSpeed:   1000 / speed,
+      glow:       0,
+      dying:      false,
+      fadeAlpha:  1,
+      tailAlphas: Array.from({ length: tailLen }, (_, t) =>
+        t === 0 ? 1 : Math.pow(1 - t / tailLen, 1.5)
+      ),
+      tailIdx:   Array.from({ length: tailLen }, (_, t) =>
+        Math.floor(t / tailLen * ALPHA_STEPS)
+      ),
+    };
+  }
+
+  // ── state ─────────────────────────────────────────────────────────────────
+
+  let streams     = [];
+  let animId      = null;
+  let lastTime    = 0;
+  let cachedTarget = 0;
+  let pulses       = [];  // active pulses: { startTime }
+  let nextPulseAt  = 0;   // timestamp for next pulse spawn
+  const waveZs     = [];  // reused scratch buffer for pulse z positions
+
+  function calcTarget() {
+    const { baseFont, density } = CONFIG;
+    const refCols = Math.floor(canvas.width / baseFont);
+    return Math.min(6000, Math.round(refCols * density * 18));
+  }
+
+  function init() {
+    cachedTarget = calcTarget();
+    streams = [];
+    for (let i = 0; i < cachedTarget; i++) {
+      const ri = Math.random(), ci = 0.28;
+      const u = ri < ci ? Math.sqrt(ri * ci) : 1 - Math.sqrt((1 - ri) * (1 - ci));
+      const z = CONFIG.zNear + (CONFIG.zFar - CONFIG.zNear) * u;
+      streams.push(spawnStream(z));
+    }
+  }
+
+  // ── draw loop ─────────────────────────────────────────────────────────────
+
+  function draw(now) {
+    const delta = Math.min(now - lastTime, 100);
+    lastTime = now;
+
+    const { focal, zNear, zFar, flySpeed, baseFont, bpm, pulseDuration, pulseWidth, pulseStrength, deathRate, deathFadeMs, glowDecayMs } = CONFIG;
+
+    const cw        = canvas.width;
+    const ch        = canvas.height;
+    const cwHalf    = cw * 0.5;
+    const deltaSec  = delta * 0.001;
+    const flyStep   = flySpeed * deltaSec;
+    const deathProb = deathRate * deltaSec;
+    const fadeStep  = delta / deathFadeMs;
+    const invFocal  = 1 / focal;
+    const invPulseW = 1 / pulseWidth;
+
+    ctx.clearRect(0, 0, cw, ch);
+
+    // ── pulses: spawn & cull ────────────────────────────────────────────────
+    const beatMs = 60000 / bpm;
+    if (now >= nextPulseAt) {
+      pulses.push({ startTime: now });
+      nextPulseAt = nextPulseAt === 0 ? now + beatMs : nextPulseAt + beatMs;
+    }
+    for (let i = pulses.length - 1; i >= 0; i--) {
+      if (now - pulses[i].startTime > pulseDuration) {
+        pulses[i] = pulses[pulses.length - 1];
+        pulses.pop();
+      }
+    }
+    waveZs.length = 0;
+    const zSpan = zFar - zNear;
+    for (let i = 0; i < pulses.length; i++) {
+      waveZs.push(zFar - zSpan * (now - pulses[i].startTime) / pulseDuration);
+    }
+    const waveCount = waveZs.length;
+    const glowDecay = Math.exp(-delta / glowDecayMs);
+
+    // update + cull (swap-and-pop for O(1) removal)
+    let len = streams.length;
+    for (let i = len - 1; i >= 0; i--) {
+      const s = streams[i];
+
+      s.z -= flyStep;
+
+      if (s.z < zNear) {
+        streams[i] = streams[--len];
+        streams.length = len;
+        continue;
+      }
+
+      if (s.dying) {
+        s.fadeAlpha -= fadeStep;
+        if (s.fadeAlpha <= 0) {
+          streams[i] = streams[--len];
+          streams.length = len;
+          continue;
+        }
+      } else {
+        s.step = s.invSpeed * s.z * invFocal;
+        s.acc += delta;
+        if (s.acc >= s.step) {
+          s.acc -= s.step;
+          s.y++;
+          const newHead = s.head === 0 ? s.tailLen - 1 : s.head - 1;
+          s.head = newHead;
+          s.chars[newHead] = randChar();
+        }
+        if (Math.random() < deathProb) s.dying = true;
+      }
+
+      s.glow *= glowDecay;
+
+      // trigger glow if wave front is passing through this stream
+      for (let p = 0; p < waveCount; p++) {
+        const d = s.z - waveZs[p];
+        const hit = (1 - (d < 0 ? -d : d) * invPulseW) * pulseStrength;
+        if (hit > s.glow) s.glow = hit;
+      }
+    }
+
+    // replenish
+    while (streams.length < cachedTarget) streams.push(spawnStream());
+
+    // render
+    let lastFont = '';
+    const streamCount = streams.length;
+    for (let si = 0; si < streamCount; si++) {
+      const s      = streams[si];
+      const scale  = focal / s.z;
+      const fontF  = Math.max(4, baseFont * scale);
+      if (fontF < 3) continue;                                  // LOD: invisible at far depth
+
+      const screenX = cwHalf + s.x * scale;
+      if (screenX < -fontF || screenX > cw + fontF) continue;  // LOD: off-screen cull
+
+      const fontPx = (fontF + 0.5) | 0;
+      const rows   = Math.ceil(ch / fontF);
+      const tailLen = s.tailLen;
+      const drawLen = fontF < 7
+        ? Math.min(tailLen, Math.max(5, fontF * 2 | 0))       // LOD: short tail for far streams
+        : tailLen;
+
+      const boost = s.glow;
+      const cc    = colorCache[s.colorIdx];
+      const chars = s.chars;
+      const head  = s.head;
+      const sy    = s.y;
+
+      const fontStr = getFont(fontPx);
+      if (fontStr !== lastFont) {
+        ctx.font = fontStr;
+        lastFont = fontStr;
+      }
+
+      if (boost > 0.01) {
+        // pulse path: 2 solid rgb strings per stream, globalAlpha for tail fade
+        const f = 1 + boost * 1.5;
+        const hr = cc.headRgb[0], hg = cc.headRgb[1], hb = cc.headRgb[2];
+        const r  = cc.body[0],    g  = cc.body[1],    b  = cc.body[2];
+        const hs = `rgb(${hr * f < 255 ? hr * f | 0 : 255},${hg * f < 255 ? hg * f | 0 : 255},${hb * f < 255 ? hb * f | 0 : 255})`;
+        const bs = `rgb(${r  * f < 255 ? r  * f | 0 : 255},${g  * f < 255 ? g  * f | 0 : 255},${b  * f < 255 ? b  * f | 0 : 255})`;
+        const tailAlphas = s.tailAlphas;
+        const fadeA = s.fadeAlpha;
+        for (let t = 0; t < drawLen; t++) {
+          const row = sy - t;
+          if (row < 0 || row > rows) continue;
+          ctx.globalAlpha = tailAlphas[t] * fadeA;
+          ctx.fillStyle   = t === 0 ? hs : bs;
+          let idx = head + t;
+          if (idx >= tailLen) idx -= tailLen;
+          ctx.fillText(chars[idx], screenX, row * fontF);
+        }
+        ctx.globalAlpha = 1;
+      } else {
+        // fast path: precomputed rgba cache, globalAlpha only when fading
+        const fading = s.fadeAlpha < 0.999;
+        if (fading) ctx.globalAlpha = s.fadeAlpha;
+        const ccTail = cc.tail;
+        const ccHead = cc.head;
+        const tailIdx = s.tailIdx;
+        for (let t = 0; t < drawLen; t++) {
+          const row = sy - t;
+          if (row < 0 || row > rows) continue;
+          ctx.fillStyle = t === 0 ? ccHead : ccTail[tailIdx[t]];
+          let idx = head + t;
+          if (idx >= tailLen) idx -= tailLen;
+          ctx.fillText(chars[idx], screenX, row * fontF);
+        }
+        if (fading) ctx.globalAlpha = 1;
+      }
+    }
+
+    animId = requestAnimationFrame(draw);
+  }
+
+  // ── start / resize ────────────────────────────────────────────────────────
+
+  function start() {
+    if (animId !== null) {
+      cancelAnimationFrame(animId);
+      animId = null;
+    }
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    lastTime = 0;
+    pulses = [];
+    nextPulseAt = 0;
+    init();
+    animId = requestAnimationFrame(draw);
+  }
+
+  window.addEventListener('resize', start);
+  start();
+</script>
+</body>
+</html>
